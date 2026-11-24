@@ -261,7 +261,7 @@ class DiffSynthesizer(nn.Module):
             self.backbone = MLPBackbone(
                 num_features=time_embed_dim,
                 out_features=d_in,
-                hidden_dim=backbone_config.get('mlp_hidden_dim', 512),
+                hidden_dim=backbone_config.get('mlp_hidden_dim', 128),
                 num_blocks=backbone_config.get('mlp_num_residual_blocks', 2)
             )
         elif backbone_type == 'transformer':

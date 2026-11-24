@@ -225,7 +225,7 @@ class GaussianDiffusion(torch.nn.Module):
         model_out = self._denoise_fn(
             x_t,
             t,
-            **out_dict
+            out_dict
         )
 
         losses = self._gaussian_loss(model_out, noise)
