@@ -61,7 +61,8 @@ class TabDiff:
         self.lr_scheduler = CosineAnnealingLR(self.optimizer, T_max=self.num_epochs)
 
         # placeholder for training history
-        self.loss_history = pd.DataFrame(columns=['epoch', 'step', 'loss'])
+        self.epoch_loss_history = pd.DataFrame(columns=['epoch', 'loss'])
+        self.step_loss_history = pd.DataFrame(columns=['step', 'loss'])
 
 
     def fit(self, train_dataloader):
@@ -87,7 +88,7 @@ class TabDiff:
             pbar.set_description(f"Epoch {epoch + 1:04d} | Train Loss: {loss:.6f}")
 
             # save training history
-            self.training_history["train_loss"].append(loss)
+            self.epoch_loss_history.loc[len(self.epoch_loss_history)] = {'epoch': epoch + 1, 'loss': loss}
 
     def train_epoch(
             self,
@@ -108,28 +109,29 @@ class TabDiff:
         total_losses = []
 
         # iterate over distinct mini-batches
-        for batch in dataloader:
+        for x, y in dataloader:
             # set network in training mode
             self.synthesizer.train()
             # push batch to compute device
-            batch_cat = batch["cat"].to(self.device)
-            batch_num = batch["num"].to(self.device)
-            if "label" in batch:
-                batch_y = batch["label"].to(self.device)
+            x = x.to(self.device)
+            if y is not None:
+                y = y.long().to(self.device)
             else:                
-                batch_y = None
+                y = None
 
             # reset encoder and decoder gradients
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             # run error back-propagation
-            loss = self.diffusion.compute_loss(x, out_dict)
+            loss = self.diffusion.compute_loss(x, y)
 
             # optimize encoder and decoder parameters
             optimizer.step()
 
             # collect rec error losses
-            total_losses.append(train_losses.detach().cpu().numpy())
+            total_losses.append(loss.detach().cpu().numpy())
+
+            self.step_loss_history.loc[len(self.step_loss_history)] = {'step': len(self.step_loss_history) + 1, 'loss': loss.detach().cpu().numpy()}
 
         # average of rec errors
         total_losses_mean = np.mean(np.array(total_losses))
