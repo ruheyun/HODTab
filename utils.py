@@ -1,0 +1,295 @@
+import torch
+import os
+import json
+import tomllib
+import tomli_w
+import numpy as np
+import pandas as pd
+import csv
+import pickle
+import torch.nn.functional as F
+from inspect import isfunction
+from torch.utils.data import Dataset
+from typing import Union, Any, Dict, cast
+from pathlib import Path
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.metrics import precision_recall_curve
+from opacus.grad_sample import GradSampleModule
+from dataclasses import dataclass
+
+RawConfig = Dict[str, Any]
+_CONFIG_NONE = '__none__'
+    
+
+def log_1_min_a(a):
+    return torch.log(1 - a.exp() + 1e-40)
+
+
+def log_add_exp(a, b):
+    maximum = torch.max(a, b)
+    return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
+
+
+def extract(a, t, x_shape):
+    t = t.to(a.device)
+    out = a.gather(-1, t)
+    while len(out.shape) < len(x_shape):
+        out = out[..., None]
+    return out.expand(x_shape)
+
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    tensor = None
+    for obj in (mean1, logvar1, mean2, logvar2):
+        if isinstance(obj, torch.Tensor):
+            tensor = obj
+            break
+    assert tensor is not None, "at least one argument must be a Tensor"
+
+    logvar1, logvar2 = [
+        x if isinstance(x, torch.Tensor) else torch.tensor(x).to(tensor)
+        for x in (logvar1, logvar2)
+    ]
+
+    return 0.5 * (
+            -1.0
+            + logvar2
+            - logvar1
+            + torch.exp(logvar1 - logvar2)
+            + ((mean1 - mean2) ** 2) * torch.exp(-logvar2)
+    )
+    
+
+def mean_flat(tensor):
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+
+def discretized_gaussian_log_likelihood(x, *, means, log_scales):
+    assert x.shape == means.shape == log_scales.shape
+    centered_x = x - means
+    inv_stdv = torch.exp(-log_scales)
+    plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
+    cdf_plus = approx_standard_normal_cdf(plus_in)
+    min_in = inv_stdv * (centered_x - 1.0 / 255.0)
+    cdf_min = approx_standard_normal_cdf(min_in)
+    log_cdf_plus = torch.log(cdf_plus.clamp(min=1e-12))
+    log_one_minus_cdf_min = torch.log((1.0 - cdf_min).clamp(min=1e-12))
+    cdf_delta = cdf_plus - cdf_min
+    log_probs = torch.where(
+        x < -0.999,
+        log_cdf_plus,
+        torch.where(x > 0.999, log_one_minus_cdf_min, torch.log(cdf_delta.clamp(min=1e-12))),
+    )
+    assert log_probs.shape == x.shape
+    return log_probs
+
+
+def approx_standard_normal_cdf(x):
+    return 0.5 * (1.0 + torch.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+
+def exists(x):
+    return x is not None
+
+
+def update_ema(target_params, source_params, rate=0.999):
+
+    with torch.no_grad():
+        for targ, src in zip(target_params, source_params):
+            targ.mul_(rate).add_(src.detach(), alpha=1 - rate)
+
+
+def load_checkpoint(path):
+    path = Path(path).resolve()
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    encoded = (path.parent / checkpoint['encoding']['path']).resolve()
+    return checkpoint, encoded
+
+
+def load_wrapper(path):
+    with open(path, "rb") as stream:
+        return pickle.load(stream)
+    
+
+@dataclass(frozen=True)
+class RunPaths:
+    root: Path
+
+    @property
+    def encoded(self):
+        return self.root / 'encoded'
+
+    @property
+    def checkpoints(self):
+        return self.root / 'checkpoints'
+
+    @property
+    def logs(self):
+        return self.root / 'logs'
+
+    def samples(self, seed):
+        return self.root / 'samples' / f'seed_{seed}'
+
+    def evaluation(self, seed):
+        return self.root / 'evaluation' / f'seed_{seed}'
+
+
+class TabularDataset(Dataset):
+
+    def __init__(self, data_path, type='train'):
+
+        df = pd.read_csv(os.path.join(data_path, f'{type}.csv'))
+
+        with open(os.path.join(data_path, 'info.json'), 'r') as f:
+            info = json.load(f)     
+
+        self.task_type = info['task_type']
+
+        if self.task_type == 'regression':
+            self.X = torch.tensor(df.values, dtype=torch.float32)
+            self.y = torch.zeros(len(df), dtype=torch.long)
+            n_features = info['n_features'] + 1
+        else:
+            if self.task_type == 'binclass':
+                label_dtype = torch.float32
+            else:
+                label_dtype = torch.long
+
+            self.y = torch.tensor(df['label'].values, dtype=label_dtype)
+            self.X = torch.tensor(df.drop(columns=['label']).values, dtype=torch.float32)
+            n_features = info['n_features']
+             
+        self.X_dim = self.X.shape[1]
+        
+        assert self.X_dim == n_features, ('data dim false!')
+
+    def __len__(self):
+
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+def evaluate(y_true, y_pred, task_type, threshold=0.5):
+    if task_type == 'binclass':
+        y_prob = y_pred                      
+        y_label = (y_prob > threshold).astype(int)
+
+        f1 = f1_score(y_true, y_label, average='weighted')
+        acc = accuracy_score(y_true, y_label)
+        auc = roc_auc_score(y_true, y_prob)
+
+    elif task_type == 'multiclass':
+        y_prob = y_pred                      
+        y_label = np.argmax(y_prob, axis=1)
+
+        f1 = f1_score(y_true, y_label, average='macro')
+        acc = accuracy_score(y_true, y_label)
+        auc = roc_auc_score(y_true, y_prob, multi_class='ovr')
+
+    elif task_type == 'regression':
+        return {
+            'rmse': float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            'mape': float(mean_absolute_percentage_error(y_true, y_pred)),
+            'r2': float(r2_score(y_true, y_pred)),
+        }
+    else:
+        raise 'Task type is error!'
+
+    return {
+        'f1': f1,
+        'accuracy': acc,
+        'roc_auc': auc
+    }
+
+
+def get_optimal_threshold_from_pr(y_true, y_prob):
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+    f1_scores = 2 * precision[1:] * recall[1:] / (precision[1:] + recall[1:] + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    return thresholds[best_idx]
+
+
+def print_metrics(results):
+    res = {
+        "val": {k: np.around(results["val"][k], 4) for k in results["val"]},
+        "test": {k: np.around(results["test"][k], 4) for k in results["test"]}
+    }
+
+    print("*"*100)
+    print("[val]")
+    print(res["val"])
+    print("[test]")
+    print(res["test"])
+
+    return res
+
+
+def average_metrics(per_model):
+    """Give each fitted model one equal vote, separately for every split/metric."""
+    if not per_model:
+        raise ValueError('At least one model is required for averaging')
+    return {
+        split: {
+            metric: sum(result[split][metric] for result in per_model.values()) / len(per_model)
+            for metric in next(iter(per_model.values()))[split]
+        }
+        for split in ['train', 'val', 'test']
+    }
+
+
+class GradNormAnalyzer:
+
+    def __init__(self, model, csv_path="exp/grad_stats.csv"):
+
+        self.model = GradSampleModule(model)
+        self.csv_path = csv_path
+
+        with open(self.csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "C95", "mean", "std", "max", "min"
+            ])
+
+    def compute_per_sample_norms(self):
+
+        batch_size = None
+        per_sample_norms = None
+
+        for p in self.model.parameters():
+            if p.grad_sample is None:
+                continue
+
+            if batch_size is None:
+                batch_size = p.grad_sample.shape[0]
+                per_sample_norms = [0.0 for _ in range(batch_size)]
+
+            for i in range(batch_size):
+                g_i = p.grad_sample[i]
+                per_sample_norms[i] += g_i.pow(2).sum().item()
+
+        per_sample_norms = [np.sqrt(x) for x in per_sample_norms]
+
+        return per_sample_norms
+
+    def log_stats(self):
+        norms = self.compute_per_sample_norms()
+
+        norms_np = np.array(norms)
+
+        C95 = np.percentile(norms_np, 95)
+        mean = np.mean(norms_np)
+        std = np.std(norms_np)
+        maxv = np.max(norms_np)
+        minv = np.min(norms_np)
+
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([C95, mean, std, maxv, minv])
+
+    def clear_grad_sample(self):
+        for p in self.model.parameters():
+            if hasattr(p, "grad_sample"):
+                p.grad_sample = None
+    
