@@ -11,4 +11,6 @@ pip install "git+https://github.com/ruheyun/tabcodec"
 pip install tqdm
 
 pip install ucimlrepo
+
+ pip install ml-collections
 ```

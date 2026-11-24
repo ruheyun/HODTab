@@ -2,6 +2,14 @@ import numpy as np
 import pandas as pd
 from ucimlrepo import fetch_ucirepo
 
+def get_data(data_name, **kwargs):
+    if data_name == 'default':
+        return default(**kwargs)
+    elif data_name == 'xor':
+        return xor(**kwargs)
+    else:
+        raise ValueError('dataset is not support')
+
 def default():
     # fetch dataset 
     default_of_credit_card_clients = fetch_ucirepo(id=350) 
@@ -12,7 +20,7 @@ def default():
 
     cols = default_of_credit_card_clients.variables
     X.columns = cols[cols["name"].isin(X.columns)]["description"].to_list()
-    y.columns = ['label']
+    y.columns = ['Label']
     
     return X, y
 
@@ -33,7 +41,7 @@ def xor(n=20000, k=3, rho=0.5, seed=42):
 
     X = np.column_stack([X, xk])
 
-    return pd.DataFrame(X, columns=[f"X{i+1}" for i in range(k)])
+    return pd.DataFrame(X, columns=[f"X{i+1}" for i in range(k)]), None
 
 
 if __name__ == "__main__":
