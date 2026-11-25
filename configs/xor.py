@@ -4,7 +4,7 @@ from tabcodec import ColumnSpec
 
 def get_config():
     config = get_base_config()
-    config.seed = 2027
+    config.seed = 2026
 
     cat_coder = config.training.cat_coder
     config.training.epoch = 100
