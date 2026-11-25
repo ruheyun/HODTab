@@ -4,11 +4,13 @@ from tabcodec import ColumnSpec
 
 def get_config():
     config = get_base_config()
+    config.seed = 2027
 
     cat_coder = config.training.cat_coder
+    config.training.epoch = 100
 
     config.data.dataset = "xor"
-    config.data.rho = 0.9
+    config.data.rho = 1
     config.data.spec = [
         ColumnSpec("X1", kind="categorical", coder=cat_coder),
         ColumnSpec("X2", kind="categorical", coder=cat_coder),

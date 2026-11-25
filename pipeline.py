@@ -1,16 +1,26 @@
 import pandas as pd
 import numpy as np
 import torch
+import json
+import os
+from pathlib import Path
 from tabcodec import TabCodec
 from model import TabDiff
 from torch.utils.data import DataLoader, TensorDataset
 from data import get_data
 from absl import flags, app
 from ml_collections.config_flags import config_flags
+from eval import evaluate
 
     
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", None, "Training configuration.", lock_config=True)
+config_flags.DEFINE_config_file("config", 'configs/xor.py', "Training configuration.", lock_config=True)
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
 
 
 def main(argv):
@@ -53,7 +63,17 @@ def main(argv):
 
     reverse = codec.inverse_transform(X)   
 
-    reverse.to_csv('reverse.csv', index=False, header=True) 
+    out_put = os.path.join('exp', data_name, str(rho), f'results{randomSeed}.json')
+
+
+    result = evaluate(reverse, rho)
+
+    write_json(out_put, {
+        **result,
+    })
+
+    reverse.to_csv(f'exp/{data_name}/{str(rho)}/reverse{randomSeed}.csv', index=False, header=True) 
+    print(f'Results saved to {out_put}')
 
 
 if __name__ == '__main__':

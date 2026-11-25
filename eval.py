@@ -39,9 +39,9 @@ def evaluate(df_syn, rho):
     coverage = np.mean(p_syn[p_real > 1e-12] > 0)
 
     return {
+        "rho_hat": rho_hat,
         "E1": E1,
         "E2": E2,
-        "rho_hat": rho_hat,
         "Ek": Ek,
         "TV": TV,
         "E_parity": E_parity,
